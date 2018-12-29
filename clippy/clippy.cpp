@@ -25,6 +25,135 @@ void RaiseError(std::string errorMessage, HRESULT hr)
 	std::cout << errorMessage << "0x" << std::uppercase << std::setfill('0') << std::setw(8) << std::hex << hr;
 }
 
+HRESULT WriteBitmapToDisk(std::string filename, 
+						  GUID encoderId,
+						  int output_width,
+						  int output_height,
+						  IWICImagingFactory* ipFactory, 
+						  IWICBitmapSource* ipBitmapSource)
+{
+	HRESULT hr;
+	IWICStream *ipStream = NULL;
+	IWICBitmapEncoder *ipBitmapEncoder = NULL;
+	IWICBitmapFrameEncode *ipFrameEncoder = NULL;
+
+	// Create the appropriate WIC Bitmap Encoder object based on whether the user wants the file to be 
+	// serialized as a PNG or a JPEG. TODO: in the future perhaps have an "auto" mode that attempts to serialize
+	// to an in-memory buffer to see which mechanism results in smaller images? 
+	// TODO: perhaps write a macro that randomly injects failing HRESULTs into debug builds to test the
+	// recovery code paths?
+	hr = ipFactory->CreateEncoder(encoderId,
+		NULL,
+		&ipBitmapEncoder);
+	if (FAILED(hr))
+	{
+		RaiseError("Could not create the PNG or JPG encoder: ", hr);
+		goto FreeCOM;
+	}
+
+	// Construct a WIC stream object using the factory
+	hr = ipFactory->CreateStream(&ipStream);
+	if (FAILED(hr)) {
+		RaiseError("Could not create an IStream object: ", hr);
+		goto FreeCOM;
+	}
+
+	// Initialize the WIC stream to write its contents out to the filename specified below. Ensure that
+	// the correct filename extension (png|jpg) is appended
+	hr = ipStream->InitializeFromFilename(s2ws(filename).c_str(), GENERIC_WRITE);
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to initialize a writeable stream: ", hr);
+		goto FreeCOM;
+	}
+
+	// Tell the WIC Bitmap Encoder to write to the WIC stream object
+	hr = ipBitmapEncoder->Initialize(ipStream, WICBitmapEncoderNoCache);
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to initialize the bitmap encoder using the stream: ", hr);
+		goto FreeCOM;
+	}
+
+	// Construct a WIC Frame Encoder object that we will be using to encode the WIC Bitmap object
+	hr = ipBitmapEncoder->CreateNewFrame(&ipFrameEncoder, NULL);
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to create a new frame encoder using the bitmap encoder: ", hr);
+		goto FreeCOM;
+	}
+
+	// Initialize the WIC Frame Encoder object. This is required otherwise subsequent calls will fail
+	hr = ipFrameEncoder->Initialize(NULL);
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to initialize the frame encoder: ", hr);
+		goto FreeCOM;
+	}
+
+	// Set the size of the frame encoder to be the final size of the image
+	hr = ipFrameEncoder->SetSize(output_width, output_height);
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to set the output size for the frame encoder: ", hr);
+		goto FreeCOM;
+	}
+
+	// Set the correct pixel format. This is RGB 8 bits per color channel.
+	WICPixelFormatGUID formatGuid;
+	formatGuid = GUID_WICPixelFormat32bppRGBA; //GUID_WICPixelFormat24bppRGB;
+	hr = ipFrameEncoder->SetPixelFormat(&formatGuid);
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to set the pixel format (WICPixelFormat24bppRGB) for the frame encoder: ", hr);
+		goto FreeCOM;
+	}
+
+	// Tell the WIC Frame Encoder to use the WIC Bitmap Scaler object we created earlier.
+	// This completes the construction of the pipeline:
+	// Bitmap -> BitmapScaler -> PngEncoder -> FrameEncoder -> Stream
+	hr = ipFrameEncoder->WriteSource(ipBitmapSource, NULL);
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to set the write source of the frame encoder to the bitmap scaler: ", hr);
+		goto FreeCOM;
+	}
+
+	// Tell the WIC Frame Encoder to serialize the frame to the stream
+	hr = ipFrameEncoder->Commit();
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to commit the frame encoder: ", hr);
+		goto FreeCOM;
+	}
+
+	// Tell the WIC Bitmap Encoder to serialize the image (which includes a frame) to the stream
+	hr = ipBitmapEncoder->Commit();
+	if (FAILED(hr))
+	{
+		RaiseError("Failed to commit the bitmap encoder: ", hr);
+		goto FreeCOM;
+	}
+
+FreeCOM:
+	if (ipStream != NULL)
+	{
+		ipStream->Release();
+	}
+
+	if (ipFrameEncoder != NULL)
+	{
+		ipFrameEncoder->Release();
+	}
+
+	if (ipBitmapEncoder != NULL)
+	{
+		ipBitmapEncoder->Release();
+	}
+
+	return hr;
+}
+
 int main(int argc, char* argv[])
 {
 	cxxopts::Options options("clippy", "Write clipboard bitmap to disk as a file");
@@ -47,9 +176,6 @@ int main(int argc, char* argv[])
 
 	IWICImagingFactory *ipFactory = NULL;
 	IWICBitmapScaler *ipScaler = NULL;
-	IWICBitmapEncoder *ipBitmapEncoder = NULL;
-	IWICStream *ipStream = NULL;
-	IWICBitmapFrameEncode *ipFrameEncoder = NULL;
 	IWICBitmap *ipBitmap = NULL;
 
 	// Attempt to open the Clipboard object. Failure will result in exit. A successful call must be balanced by
@@ -117,8 +243,20 @@ int main(int argc, char* argv[])
 		goto FreeCOM;
 	}
 
-	// Compute the output image width and height by constraining
-	// the maximum width of the image to 800px.
+	// Write full-sized image
+	if (write_full)
+	{
+		hr = WriteBitmapToDisk(filename + "_full." + encoder, encoderId, width, height, ipFactory, ipBitmap);
+		if (FAILED(hr))
+		{
+			RaiseError("Could not write full sized image to disk: ", hr);
+			goto FreeCOM;
+		}
+	}
+
+	// Write resized image
+
+	// Compute the output image width and height by constraining the maximum width of the image to max_width
 	UINT output_width, output_height;
 	float scaling_factor;
 	scaling_factor = (float)((float)max_width / (float)width);
@@ -146,126 +284,19 @@ int main(int argc, char* argv[])
 		goto FreeCOM;
 	}
 
-	// Create the appropriate WIC Bitmap Encoder object based on whether the user wants the file to be 
-	// serialized as a PNG or a JPEG. TODO: in the future perhaps have an "auto" mode that attempts to serialize
-	// to an in-memory buffer to see which mechanism results in smaller images? 
-	// TODO: perhaps write a macro that randomly injects failing HRESULTs into debug builds to test the
-	// recovery code paths?
-	hr = ipFactory->CreateEncoder(encoderId,
-		NULL,
-		&ipBitmapEncoder);
+	hr = WriteBitmapToDisk(filename + "." + encoder, encoderId, output_width, output_height, ipFactory, ipScaler);
 	if (FAILED(hr))
 	{
-		RaiseError("Could not create the PNG or JPG encoder: ", hr);
-		goto FreeCOM;
-	}
-
-	// Construct a WIC stream object using the factory
-	hr = ipFactory->CreateStream(&ipStream);
-	if (FAILED(hr)) {
-		RaiseError("Could not create an IStream object: ", hr);
-		goto FreeCOM;
-	}
-
-	// Initialize the WIC stream to write its contents out to the filename specified below. Ensure that
-	// the correct filename extension (png|jpg) is appended
-	hr = ipStream->InitializeFromFilename(s2ws((filename + "." + encoder)).c_str(), GENERIC_WRITE);
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to initialize a writeable stream: ", hr);
-		goto FreeCOM;
-	}
-
-	// Tell the WIC Bitmap Encoder to write to the WIC stream object
-	hr = ipBitmapEncoder->Initialize(ipStream, WICBitmapEncoderNoCache);
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to initialize the bitmap encoder using the stream: ", hr);
-		goto FreeCOM;
-	}
-
-	// Construct a WIC Frame Encoder object that we will be using to encode the WIC Bitmap object
-	hr = ipBitmapEncoder->CreateNewFrame(&ipFrameEncoder, NULL);
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to create a new frame encoder using the bitmap encoder: ", hr);
-		goto FreeCOM;
-	}
-
-	// Initialize the WIC Frame Encoder object. This is required otherwise subsequent calls will fail
-	hr = ipFrameEncoder->Initialize(NULL);
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to initialize the frame encoder: ", hr);
-		goto FreeCOM;
-	}
-
-	// Set the size of the frame encoder to be the final size of the image
-	// TODO: when we do this twice - for original and resized image we may want to factor this code out 
-	hr = ipFrameEncoder->SetSize(output_width, output_height);
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to set the output size for the frame encoder: ", hr);
-		goto FreeCOM;
-	}
-
-	// Set the correct pixel format. This is RGB 8 bits per color channel.
-	WICPixelFormatGUID formatGuid;
-	formatGuid = GUID_WICPixelFormat24bppRGB;
-	hr = ipFrameEncoder->SetPixelFormat(&formatGuid);
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to set the pixel format (WICPixelFormat24bppRGB) for the frame encoder: ", hr);
-		goto FreeCOM;
-	}
-
-	// Tell the WIC Frame Encoder to use the WIC Bitmap Scaler object we created earlier.
-	// This completes the construction of the pipeline:
-	// Bitmap -> BitmapScaler -> PngEncoder -> FrameEncoder -> Stream
-	hr = ipFrameEncoder->WriteSource(ipScaler, NULL);
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to set the write source of the frame encoder to the bitmap scaler: ", hr);
-		goto FreeCOM;
-	}
-
-	// Tell the WIC Frame Encoder to serialize the frame to the stream
-	hr = ipFrameEncoder->Commit();
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to commit the frame encoder: ", hr);
-		goto FreeCOM;
-	}
-
-	// Tell the WIC Bitmap Encoder to serialize the image (which includes a frame) to the stream
-	hr = ipBitmapEncoder->Commit();
-	if (FAILED(hr))
-	{
-		RaiseError("Failed to commit the bitmap encoder: ", hr);
+		RaiseError("Could not write resized image to disk: ", hr);
 		goto FreeCOM;
 	}
 
 FreeCOM:
 	// Free all COM interfaces that have been assigned. There should only be a single AddRef to any
 	// of these interfaces, so the single Release if unassigned will do the right thing.
-	if (ipStream != NULL)
-	{
-		ipStream->Release();
-	}
-
 	if (ipScaler != NULL)
 	{
 		ipScaler->Release();
-	}
-
-	if (ipBitmapEncoder != NULL)
-	{
-		ipBitmapEncoder->Release();
-	}
-
-	if (ipFrameEncoder != NULL)
-	{
-		ipFrameEncoder->Release();
 	}
 
 	if (ipFactory != NULL)
