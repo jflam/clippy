@@ -22,7 +22,7 @@ std::wstring s2ws(const std::string& s)
 // Helper method that generates an error message + 32 bit hex representation of the HRESULT
 void RaiseError(std::string errorMessage, HRESULT hr)
 {
-	std::cout << errorMessage << "0x" << std::uppercase << std::setfill('0') << std::setw(8) << std::hex << hr;
+	std::cout << errorMessage << ": HRESULT = 0x" << std::uppercase << std::setfill('0') << std::setw(8) << std::hex << hr;
 }
 
 HRESULT WriteBitmapToDisk(std::string filename, 
@@ -158,16 +158,19 @@ int main(int argc, char* argv[])
 {
 	cxxopts::Options options("clippy", "Write clipboard bitmap to disk as a file");
 	options.add_options()
-		("max_width", "Maximum width of image (defaults to 800)", cxxopts::value<int>())
-		("write_full", "Write full sized image in addition to resized image to disk")
-		("f,filename", "Filename to write, but without extension", cxxopts::value<std::string>())
-		("encoder", "Bitmap encoder to use: png or jpeg", cxxopts::value<std::string>());
+		("max_width", "Maximum width of image (defaults to 800)", cxxopts::value<int>()->default_value("800"))
+		("write_full", "Write full sized image in addition to resized image to disk", cxxopts::value<bool>()->default_value("false"))
+		("f,filename", "Filename to write, but without extension (defaults to 'image')", cxxopts::value<std::string>()->default_value("image"))
+		("encoder", "Bitmap encoder to use: (png|jpeg, defaults to png)", cxxopts::value<std::string>()->default_value("png"))
+		("test_clipboard_has_bitmap", "If true, only tests to see if clipboard contains a bitmap. Writes TRUE to stdout if it does", cxxopts::value<bool>()->default_value("false"));
 
+	// TODO: validate the parameters
 	auto result = options.parse(argc, argv);
 	std::string filename = result["filename"].as<std::string>();
 	int max_width = result["max_width"].as<int>();
 	bool write_full = result["write_full"].as<bool>();
 	std::string encoder = result["encoder"].as<std::string>();
+	bool test_clipboard_has_bitmap = result["test_clipboard_has_bitmap"].as<bool>();
 
 	GUID encoderId = encoder == "png" ? GUID_ContainerFormatPng : GUID_ContainerFormatJpeg;
 
@@ -182,13 +185,24 @@ int main(int argc, char* argv[])
 	// a call to CloseClipboard()
 	if (!OpenClipboard(NULL))
 	{
+		RaiseError("Failed to open the clipboard object", E_FAIL);
 		return 1;
 	}
 
 	// Attempt to retrieve a HBITMAP object from the clipboard. Failure is OK - there is no bitmap to write to disk.
 	hBitmap = reinterpret_cast<HBITMAP>(GetClipboardData(CF_BITMAP));
+
+	// If caller is looking for the presence of a bitmap on the clipboard, return TRUE or FALSE and exit normally
+	if (test_clipboard_has_bitmap)
+	{
+		std::cout << (hBitmap == NULL ? "FALSE" : "TRUE");
+		return 0;
+	}
+
+	// Caller wants to write bitmap to disk, so a missing bitmap is a failure exit
 	if (hBitmap == NULL)
 	{
+		RaiseError("No bitmap on clipboard", E_FAIL);
 		goto FreeClipboard;
 	}
 
@@ -313,5 +327,5 @@ FreeClipboard:
 	CloseClipboard();
 
 	// Returns 0 if file written to disk, 1 if an error occurred
-	return 0;
+	return SUCCEEDED(hr) ? 0 : 1;
 }
